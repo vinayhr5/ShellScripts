@@ -1,0 +1,90 @@
+#!/bin/bash
+
+# Parameterize log file path
+LOG_FILE="efslogscleanup_logs.txt"
+
+# Function to log messages
+log() {
+  local message="$1"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $message" >> "$LOG_FILE"
+}
+
+# Function to log errors and exit
+log_error_and_exit() {
+  local message="$1"
+  log "Error: $message"
+  exit 1
+}
+
+# Initialize log file
+echo "Efslogscleanup Script Execution Log" > "$LOG_FILE"
+
+# Define ECS cluster name
+ECS_CLUSTER="Test-Cluster"
+
+# Log script start
+log "Script started."
+
+# Retrieve the list of services for the specified cluster
+services=$(aws ecs list-services --cluster "$ECS_CLUSTER" --query "serviceArns[]" --output json 2>> "$LOG_FILE" | jq -r '.[]') || log_error_and_exit "Failed to retrieve services."
+
+# Loop through each service ARN
+for service_arn in $services; do
+  log "Processing service ARN: $service_arn"
+  
+  # Retrieve the running task definition for the current service
+  task_definition=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$service_arn" --query "services[].taskDefinition" --output json 2>> "$LOG_FILE" | jq -r '.[]') || log_error_and_exit "Failed to retrieve task definition."
+
+  log "Task Definition: $task_definition"
+  
+  # Retrieve the log path from environment variables in the task definition
+  log_path=$(aws ecs describe-task-definition --task-definition "$task_definition" --query "taskDefinition.containerDefinitions[].environment[?name=='LOG_PATH'].value" --output text 2>> "$LOG_FILE") || log_error_and_exit "Failed to retrieve log path."
+
+  log "Log Path: $log_path"
+  
+  # List directories inside the log path
+  directories=$(ls -d "/efs$log_path/*/" 2>> "$LOG_FILE") || log_error_and_exit "Failed to list directories."
+
+  # Loop through each directory
+  for directory in $directories; do
+    dir_name=$(basename "$directory")
+
+    # Check if the directory is empty
+    if [ -z "$(ls -A "$directory")" ]; then
+      log "Directory $dir_name is empty. Deleting..."
+      rmdir "$directory" 2>> "$LOG_FILE" || log_error_and_exit "Failed to delete directory."
+    else
+      # Retrieve the task details including private IP address
+      task_arns=$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$service_arn" --output json 2>> "$LOG_FILE" | jq -r '.taskArns[]') || log_error_and_exit "Failed to retrieve task ARNs."
+
+      # Check if there are tasks running for the service
+      if [[ -n "$task_arns" ]]; then
+        task_details=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task_arns" --output json 2>> "$LOG_FILE") || log_error_and_exit "Failed to retrieve task details."
+        private_ip=$(echo "$task_details" | jq -r '.tasks[].containers[].networkInterfaces[].privateIpv4Address')
+        modified_private_ip=$(echo "$private_ip" | tr '.' '-')
+        log "Directory: $dir_name"
+        log "Private IP: $private_ip"
+        log "Modified Private IP: $modified_private_ip"
+        
+        # Check if modified private IP is in folder name
+        if [[ "$dir_name" == *"$modified_private_ip"* ]]; then
+          log "Skipping directory as modified private IP is present in folder name."
+        else
+          log "Files (older than 30 days):"
+          # List files inside directory that are older than 30 days
+          find "$directory" -type f -mtime +30 -exec ls {} \;
+          log "Deleting files older than 30 days..."
+          # Delete files inside directory that are older than 30 days
+          find "$directory" -type f -mtime +30 -delete 2>> "$LOG_FILE" || log_error_and_exit "Failed to delete files."
+        fi
+      else
+        log "No tasks running for the service."
+      fi
+    fi
+  done
+  
+  log "---"
+done
+
+# Log script end
+log "Script completed."
